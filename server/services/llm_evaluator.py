@@ -190,10 +190,16 @@ class LLMComplianceEvaluator:
             "     * However, Rule 24 and Rule 2(kc) mandate that multi-piece packages MUST also declare the Total Net Quantity (e.g. '150 g' or '30 N x 5 g = 150 g').\n"
             "     * If total net weight is missing, do NOT call 'N' non-standard! Mark violation_type='missing_total_quantity', explain: 'Multi-piece package declares individual units (30 N x 5 g) but omits mandatory Total Net Quantity (150 g) under Rule 24'.\n"
             "   - Prohibited non-standard symbols are: 'gms', 'gm', 'ltrs', 'kgs'. If used, mark violation_type='wrong_format'.\n"
-            "6. Always preserve exact verbatim spacing and capitalization from OCR (e.g. '30 N x 5 g', never squish to '30Nx5g').\n"
-            "7. Keep 'explanation' concise (maximum 15 words).\n"
-            "8. Return ONLY a valid JSON object matching the requested schema without any markdown formatting.\n"
-            "9. MULTI-FACE PRODUCT EVALUATION (applies when the OCR text contains several label faces of the SAME product):\n"
+            "6. Unit Sale Price (USP) Recognition — VERY IMPORTANT:\n"
+            "   - A Unit Sale Price is ANY price-per-unit expression in the format: PRICE/UNIT or PRICE PER UNIT.\n"
+            "   - Valid unit denominators include: /N, /U, /g, /kg, /ml, /L, /pcs, /piece, /tablet, /sachet, /pack, /unit.\n"
+            "   - Examples that ARE a valid Unit Sale Price: 'RS.10.00/N', 'Rs.10/N', 'Rs 5.00/g', '₹10/pcs', 'MRP Rs.10.00/N', 'RS.9.00/N'.\n"
+            "   - The label text 'Unit Sale Price, please see above' or 'Unit Sale Price as above' means the USP IS declared on another sticker/panel on the same package — treat this as PASS with exact_quote='(see sticker above)'.\n"
+            "   - Do NOT mark USP as missing if ANY price-per-unit expression (e.g. RS.10.00/N) appears ANYWHERE in the OCR text.\n"
+            "7. Always preserve exact verbatim spacing and capitalization from OCR (e.g. '30 N x 5 g', never squish to '30Nx5g').\n"
+            "8. Keep 'explanation' concise (maximum 15 words).\n"
+            "9. Return ONLY a valid JSON object matching the requested schema without any markdown formatting.\n"
+            "10. MULTI-FACE PRODUCT EVALUATION (applies when the OCR text contains several label faces of the SAME product):\n"
             "   - A mandatory declaration printed on ANY face is PRESENT on the product.\n"
             "   - Mark status='FAIL' with violation_type='missing' ONLY when the declaration is absent from ALL faces.\n"
             "   - Cite the exact_quote from the face where the declaration actually appears.\n\n"
@@ -289,7 +295,7 @@ class LLMComplianceEvaluator:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0.0,
-            "max_tokens": 2048
+            "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "600"))
         }
 
         try:
@@ -403,6 +409,31 @@ class LLMComplianceEvaluator:
                                 field_name=field_name,
                                 description=rule_meta.get("description", ""),
                                 required=rule_meta.get("required", True),
+                                citation=citation
+                            )
+                        )
+                    else:
+                        confidence = round(matched_block.confidence, 2) if (matched_block and matched_block.confidence) else 0.95
+                        font_size_px = (
+                            matched_block.size.estimated_font_size_px
+                            if (matched_block and hasattr(matched_block, "size") and matched_block.size and matched_block.size.estimated_font_size_px)
+                            else 20.0
+                        )
+                        img_h = ocr_result.image_metadata.height if (ocr_result and ocr_result.image_metadata and ocr_result.image_metadata.height) else 1000
+                        font_size_mm_est = round(max((font_size_px / max(img_h, 1)) * 150.0, 1.0), 1)
+                        found_declarations.append(
+                            DeclarationFound(
+                                id=rid,
+                                field_name=field_name,
+                                extracted_text=ev.exact_quote or ev.detected_on_package or ev.extracted_value or "",
+                                parsed_value=ev.extracted_value or ev.detected_on_package,
+                                confidence=confidence,
+                                bbox=bbox,
+                                font_size_px=font_size_px,
+                                font_size_mm_est=font_size_mm_est,
+                                format_valid=False,
+                                size_valid=ev.violation_type != "too_small",
+                                status="FAIL",
                                 citation=citation
                             )
                         )

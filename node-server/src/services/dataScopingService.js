@@ -119,6 +119,18 @@ export function getComplaintScope(user) {
         : { district: { equals: String(user.district).trim(), mode: "insensitive" } };
 
     case ROLES.REVIEWER:
+      if (!user.district) {
+        return { consumerId: user.id };
+      }
+      // Show district-matched complaints OR unrouted (district=null) complaints
+      // so that legacy/unrouted complaints are visible for triage.
+      return {
+        OR: [
+          { district: { equals: String(user.district).trim(), mode: "insensitive" } },
+          { district: null },
+        ],
+      };
+
     case ROLES.INSPECTOR:
       if (!user.district) {
         return { consumerId: user.id };

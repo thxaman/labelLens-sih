@@ -1,12 +1,11 @@
 import prisma from "../config/db.js";
 const FASTAPI_BASE_URL = process.env.FASTAPI_URL || "http://127.0.0.1:8000";
 
-// Timeouts (ms) so a hung FastAPI process fails fast instead of leaving the
-// client request open indefinitely.
-const OCR_TIMEOUT_MS = parseInt(process.env.FASTAPI_OCR_TIMEOUT_MS, 10) || 60_000;
-const EVAL_TIMEOUT_MS = parseInt(process.env.FASTAPI_EVAL_TIMEOUT_MS, 10) || 30_000;
+// Timeouts (ms) so a hung FastAPI process fails gracefully without aborting heavy OCR runs prematurely.
+const OCR_TIMEOUT_MS = parseInt(process.env.FASTAPI_OCR_TIMEOUT_MS, 10) || 120_000;
+const EVAL_TIMEOUT_MS = parseInt(process.env.FASTAPI_EVAL_TIMEOUT_MS, 10) || 60_000;
 const VIDEO_TIMEOUT_MS = parseInt(process.env.FASTAPI_VIDEO_TIMEOUT_MS, 10) || 180_000;
-const DEFAULT_TIMEOUT_MS = parseInt(process.env.FASTAPI_TIMEOUT_MS, 10) || 30_000;
+const DEFAULT_TIMEOUT_MS = parseInt(process.env.FASTAPI_TIMEOUT_MS, 10) || 60_000;
 
 function timeoutError(operation, status) {
   return new Error(

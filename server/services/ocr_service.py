@@ -60,7 +60,15 @@ class OCRService:
         height, width = img_np.shape[0], img_np.shape[1]
         scale_factor = 1.0
 
-        if width < 800 or height < 800:
+        # Cap oversized photos to max dimension 2048px for CPU inference speed (scales back automatically)
+        max_dim = max(width, height)
+        if max_dim > 2048:
+            down_scale = 2048.0 / max_dim
+            scale_factor = down_scale
+            new_w = int(width * down_scale)
+            new_h = int(height * down_scale)
+            img_np = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        elif width < 800 or height < 800:
             scale_factor = 2.5 if width < 400 else 2.0
             new_w = int(width * scale_factor)
             new_h = int(height * scale_factor)
@@ -90,12 +98,18 @@ class OCRService:
         Ideal for low-contrast, faded, or reflective packaging labels.
         """
         height, width = img_np.shape[0], img_np.shape[1]
-        scale_factor = 3.0 if width < 800 else (2.0 if width < 1400 else 1.0)
-
-        if scale_factor > 1.0:
+        max_dim = max(width, height)
+        if max_dim > 2048:
+            scale_factor = 2048.0 / max_dim
             new_w = int(width * scale_factor)
             new_h = int(height * scale_factor)
-            img_np = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            img_np = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            scale_factor = 2.0 if width < 800 else (1.5 if width < 1200 else 1.0)
+            if scale_factor > 1.0:
+                new_w = int(width * scale_factor)
+                new_h = int(height * scale_factor)
+                img_np = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
         if len(img_np.shape) == 2:
             img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2RGB)
@@ -316,7 +330,9 @@ class OCRService:
 
             # Evaluate Early-Exit Condition:
             mean_conf = (sum(b.confidence for b in blocks) / len(blocks)) if blocks else 0.0
-            should_fallback = fallback and (len(blocks) < 5 or mean_conf < 0.70)
+            # If standard pass already found good text, don't trigger 3 expensive fallback OCR passes on CPU
+            has_sufficient_text = (len(blocks) >= 3 and mean_conf >= 0.60) or (len(blocks) >= 1 and mean_conf >= 0.75)
+            should_fallback = fallback and not has_sufficient_text and (len(blocks) < 2 or mean_conf < 0.50)
 
             if should_fallback:
                 logger.info(
@@ -331,6 +347,11 @@ class OCRService:
                 ]
 
                 for name, prep_func in fallback_stages:
+                    # Enforce a 12-second total time budget so OCR never causes a gateway timeout
+                    if (time.time() - start_time) > 12.0:
+                        logger.warning("OCR fallback reached time budget (%.2fs), returning detected blocks", time.time() - start_time)
+                        break
+
                     pipelines_run.append(name)
                     fb_img, fb_scale = prep_func(img_np)
                     fb_blocks = self._run_engine_on_image(fb_img, fb_scale, min_confidence)
@@ -338,7 +359,7 @@ class OCRService:
 
                     # Check if candidate pool reached healthy threshold
                     curr_conf = (sum(b.confidence for b in blocks) / len(blocks)) if blocks else 0.0
-                    if len(blocks) >= 6 and curr_conf >= 0.70:
+                    if len(blocks) >= 4 and curr_conf >= 0.65:
                         break
 
             raw_lines = [b.text for b in blocks]

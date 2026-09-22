@@ -5,7 +5,12 @@ import uuid
 import base64
 import logging
 from typing import List, Dict, Any, Optional
-from PIL import Image, ImageDraw
+
+try:
+    from PIL import Image, ImageDraw  # type: ignore
+except ImportError:
+    Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
 
 from schemas.ocr import OCRScanResult, TextBlock, BBox
 from schemas.compliance import (
@@ -123,7 +128,7 @@ CATEGORY_RULE_PATTERNS = {
     },
     "unit_sale_price": {
         "keywords": ["UNIT SALE PRICE", "UNIT PRICE", "USP", "PRICE PER"],
-        "regex": r"(?:USP|UNIT\s*SALE\s*PRICE|UNIT\s*PRICE)[^\d]*[\d,]+(?:\.\d{1,2})?"
+        "regex": r"(?:(?:RS\.?|₹|INR)\s*)?\d+(?:\.\d{1,2})?\s*(?:/|PER\s+)(?:G|GM|GMS|KG|KGS|ML|MLS|L|LTR|LTRS|LITRE|LITER|N|U|PCS|PIECE|PIECES|NUMBER|TABLET|TABLETS|SACHET|SACHETS|UNIT|UNITS)\b"
     },
     "pan_masala_warning": {
         "keywords": ["CHEWING OF PAN MASALA", "INJURIOUS TO HEALTH", "PAN MASALA", "GUTKHA", "HEALTH WARNING"],
@@ -225,7 +230,18 @@ def has_tax_clause(norm: str) -> bool:
 # Currency token as a WORD (plus the glued "Rs250" spelling OCR often produces).
 _CURRENCY_RE = re.compile(r"₹|\bINR\b|\bRS\b|\bRS(?=[.\d])")
 
-_QUANTITY_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(G|KG|ML|L|N|GM|GMS|LTRS)\b")
+# Unit Sale Price rate expressions (e.g. RS.10.00/N, Rs. 5/g, 10.00/N, ₹10/pcs)
+_UNIT_SALE_PRICE_RATE_RE = re.compile(
+    r'(?:(?:RS\.?|₹|INR)\s*)?\d+(?:\.\d{1,2})?\s*(?:/|PER\s+)(?:G|GM|GMS|KG|KGS|ML|MLS|L|LTR|LTRS|LITRE|LITER|N|U|PCS|PIECE|PIECES|NUMBER|TABLET|TABLETS|SACHET|SACHETS|UNIT|UNITS)\b',
+    re.IGNORECASE
+)
+_USP_KEYWORD_RE = re.compile(r'\b(?:USP|UNIT\s*SALE\s*PRICE|UNIT\s*PRICE)\b', re.IGNORECASE)
+_USP_POINTER_RE = re.compile(
+    r'(?:UNIT\s*SALE\s*PRICE|UNIT\s*PRICE|USP)[^\n.]*(?:SEE\s+(?:ABOVE|BELOW|ON|PANEL|STAMP)|AS\s+ABOVE)',
+    re.IGNORECASE
+)
+
+_QUANTITY_RE = re.compile(r"(?:\b\d+\s*[NnUu]?\s*[xX*]\s*\d+(?:\.\d+)?\s*(?:G|KG|ML|L|GM|GMS|LTRS|N|U)?\b|\b\d+(?:\.\d+)?\s*(G|KG|ML|L|N|GM|GMS|LTRS|U)\b)")
 # Deliberately restricted to '/' and '-' separators: allowing '.' would make the price
 # "50.00" read as a date.
 _DATE_RE = re.compile(r"\b\d{2}[/\-]\d{2,4}\b")
@@ -241,7 +257,7 @@ _NET_QTY_KEYWORDS = ["NET QTY", "NET WT", "NET WEIGHT", "NET CONTENT", "NET CONT
 _MFG_DATE_KEYWORDS = ["MFG", "MFD", "PKD", "MANUFACTURE", "MANUFACTURED ON", "PACKED", "BEST BEFORE", "USE BY", "EXP DATE", "EXPIRY"]
 _MANUFACTURER_KEYWORDS = [
     "MFD BY", "MANUFACTURED BY", "PACKED BY", "PACKAGED BY", "MARKETED BY", "MKTD BY", "PRODUCED BY",
-    "REGD OFFICE", "REGISTERED OFFICE", "WORKS", "FACTORY", "UNIT", "PVT LTD",
+    "REGD OFFICE", "REGISTERED OFFICE", "WORKS", "FACTORY", "MFG UNIT", "FACTORY UNIT", "PVT LTD",
     "PRIVATE LIMITED", "LIMITED", "LTD", "LLP", "INC", "CORP", "INDUSTRIES", "ENTERPRISES",
 ]
 _CONSUMER_CARE_KEYWORDS = ["CONSUMER", "CUSTOMER CARE", "FEEDBACK", "CALL US", "E MAIL", "EMAIL", "TOLL FREE", "HELPLINE"]
@@ -289,76 +305,130 @@ class ComplianceEvaluator:
         # 1. Direct LLM Evaluation Hook (Groq / Qwen)
         llm_eval = get_llm_evaluator()
         if llm_eval.is_available():
-            llm_result = llm_eval.evaluate_with_llm(
-                ocr_result,
-                category=self.category,
-                ruleset=self.ruleset,
-                face_texts=face_texts
-            )
-            if llm_result is not None:
-                # Attach official statutory legal citations to LLM findings
-                citation_svc = get_citation_service()
-                for d in llm_result.summary.what_was_found:
-                    if not d.citation:
-                        d.citation = citation_svc.get_citation(d.id)
-                    # Enforce Rule 12 check on net quantity
-                    if d.id == "net_quantity":
-                        t_upper = flatten_text(d.extracted_text)
-                        illegal_match = re.search(r'\b(GMS|GM|G\.|GM\.|GMS\.|KGS|KG\.|KILO|KILOS|LTR|LTRS|LTR\.|LIT|LITERS|LITRES|MLS|ML\.|M\.L\.|MTS|MTR|MTRS)\b', t_upper)
-                        if illegal_match:
-                            d.format_valid = False
-                            d.status = "FORMAT_ERROR"
-                            illegal_sym = illegal_match.group(0)
-                            rule12_cit = citation_svc.get_citation("rule_12_metric_symbol")
-                            if not any(v.rule_id == "net_quantity" and v.violation_type == "wrong_format" for v in llm_result.summary.whats_wrong):
-                                llm_result.summary.whats_wrong.append(ViolationDetail(
-                                    id=f"viol_rule12_net_qty_{uuid.uuid4().hex[:12]}",
-                                    rule_id="net_quantity",
-                                    field_name="Net Quantity",
-                                    violation_type="wrong_format",
-                                    severity="MAJOR",
-                                    description=f"Net Quantity uses illegal non-standard unit symbol '{illegal_sym}'. Legal Metrology Rule 12 & Third Schedule strictly mandates standard SI symbols ('g', 'kg', 'ml', 'L', 'N').",
-                                    evidence_bbox=d.bbox,
-                                    citation=rule12_cit
-                                ))
-                                llm_result.overall_result = "FAIL"
-                                llm_result.compliance_score = max(round(llm_result.compliance_score - 15.0, 1), 0.0)
+            try:
+                llm_result = llm_eval.evaluate_with_llm(
+                    ocr_result,
+                    category=self.category,
+                    ruleset=self.ruleset,
+                    face_texts=face_texts
+                )
+                if llm_result is not None:
+                    # Attach official statutory legal citations to LLM findings
+                    citation_svc = get_citation_service()
+                    for d in llm_result.summary.what_was_found:
+                        if not d.citation:
+                            d.citation = citation_svc.get_citation(d.id)
+                        # Enforce Rule 12 check on net quantity
+                        if d.id == "net_quantity":
+                            t_upper = flatten_text(d.extracted_text)
+                            illegal_match = re.search(r'\b(GMS|GM|G\.|GM\.|GMS\.|KGS|KG\.|KILO|KILOS|LTR|LTRS|LTR\.|LIT|LITERS|LITRES|MLS|ML\.|M\.L\.|MTS|MTR|MTRS)\b', t_upper)
+                            if illegal_match:
+                                d.format_valid = False
+                                d.status = "FORMAT_ERROR"
+                                illegal_sym = illegal_match.group(0)
+                                rule12_cit = citation_svc.get_citation("rule_12_metric_symbol")
+                                if not any(v.rule_id == "net_quantity" and v.violation_type == "wrong_format" for v in llm_result.summary.whats_wrong):
+                                    llm_result.summary.whats_wrong.append(ViolationDetail(
+                                        id=f"viol_rule12_net_qty_{uuid.uuid4().hex[:12]}",
+                                        rule_id="net_quantity",
+                                        field_name="Net Quantity",
+                                        violation_type="wrong_format",
+                                        severity="MAJOR",
+                                        description=f"Net Quantity uses illegal non-standard unit symbol '{illegal_sym}'. Legal Metrology Rule 12 & Third Schedule strictly mandates standard SI symbols ('g', 'kg', 'ml', 'L', 'N').",
+                                        evidence_bbox=d.bbox,
+                                        citation=rule12_cit
+                                    ))
+                                    llm_result.overall_result = "FAIL"
+                                    llm_result.compliance_score = max(round(llm_result.compliance_score - 15.0, 1), 0.0)
 
-                for m in llm_result.summary.whats_missing:
-                    if not m.citation:
-                        m.citation = citation_svc.get_citation(m.id)
-                for v in llm_result.summary.whats_wrong:
-                    # Sanitize multi-piece net quantity violations
-                    if v.rule_id in ("net_quantity", "multi_piece_net_quantity"):
-                        desc_lower = (v.description or "").lower()
-                        if "non-standard" in desc_lower or "instead of total" in desc_lower or "30nx5g" in desc_lower or "wrong_format" in str(v.violation_type).lower():
-                            raw_nq = next((d.extracted_text for d in llm_result.summary.what_was_found if d.id == "net_quantity"), "30 N x 5 g")
-                            clean_nq = re.sub(r'(\d+)\s*N\s*x\s*(\d+)\s*g', r'\1 N x \2 g', raw_nq, flags=re.I)
-                            v.title = "Net Quantity (Multi-Piece Package) - MISSING_TOTAL_QUANTITY"
-                            v.rule_id = "multi_piece_net_quantity"
-                            v.violation_type = "missing_total_quantity"
-                            v.severity = "MAJOR"
-                            v.description = (
-                                f"Multi-piece package declares individual units ('{clean_nq}', where 'N' = Number of Units) "
-                                "but omits the mandatory Total Net Quantity (e.g., '150 g' or '30 N x 5 g = 150 g'). "
-                                "Rule 24 & Rule 2(kc) of Legal Metrology (Packaged Commodities) Rules, 2011 strictly mandate "
-                                "that multi-piece packages declare both the individual pieces and the total net quantity."
+                    for m in llm_result.summary.whats_missing:
+                        if not m.citation:
+                            m.citation = citation_svc.get_citation(m.id)
+                    for v in llm_result.summary.whats_wrong:
+                        # Sanitize multi-piece net quantity violations
+                        if v.rule_id in ("net_quantity", "multi_piece_net_quantity"):
+                            desc_lower = (v.description or "").lower()
+                            if "non-standard" in desc_lower or "instead of total" in desc_lower or "30nx5g" in desc_lower or "wrong_format" in str(v.violation_type).lower():
+                                raw_nq = next((d.extracted_text for d in llm_result.summary.what_was_found if d.id == "net_quantity"), "30 N x 5 g")
+                                clean_nq = re.sub(r'(\d+)\s*N\s*x\s*(\d+)\s*g', r'\1 N x \2 g', raw_nq, flags=re.I)
+                                v.rule_id = "multi_piece_net_quantity"
+                                v.field_name = "Net Quantity (Multi-Piece Package)"
+                                v.violation_type = "missing_total_quantity"
+                                v.severity = "MAJOR"
+                                v.description = (
+                                    f"Multi-piece package declares individual units ('{clean_nq}', where 'N' = Number of Units) "
+                                    "but omits the mandatory Total Net Quantity (e.g., '150 g' or '30 N x 5 g = 150 g'). "
+                                    "Rule 24 & Rule 2(kc) of Legal Metrology (Packaged Commodities) Rules, 2011 strictly mandate "
+                                    "that multi-piece packages declare both the individual pieces and the total net quantity."
+                                )
+                                v.detected_on_package = clean_nq
+                                v.expected_on_package = "Total Net Quantity: 150 g (30 N x 5 g)"
+                                v.citation = citation_svc.get_citation("multi_piece_net_quantity") or citation_svc.get_citation("rule_24_multi_piece")
+                        if not v.citation:
+                            v.citation = citation_svc.get_citation(v.rule_id)
+
+                    # Reconcile Unit Sale Price: Contextual understanding beyond literal keyword matching.
+                    # Packaged goods often declare USP as a price-per-unit on batch stickers (e.g. RS.10.00/N)
+                    # and/or refer to it via pointer text ("Unit Sale Price, please see above").
+                    usp_rate_match = None
+                    usp_rate_block = None
+                    for b in ocr_result.text_blocks:
+                        m_usp = _UNIT_SALE_PRICE_RATE_RE.search(flatten_text(b.text))
+                        if m_usp:
+                            usp_rate_match = m_usp.group(0)
+                            usp_rate_block = b
+                            break
+
+                    doc_text = self._document_text(ocr_result)
+                    has_usp_pointer = bool(_USP_POINTER_RE.search(doc_text))
+
+                    if usp_rate_match or has_usp_pointer:
+                        missing_usp = [m for m in llm_result.summary.whats_missing if m.id == "unit_sale_price"]
+                        if missing_usp:
+                            llm_result.summary.whats_missing = [m for m in llm_result.summary.whats_missing if m.id != "unit_sale_price"]
+                            llm_result.compliance_score = min(round(llm_result.compliance_score + 10.0, 1), 100.0)
+
+                        llm_result.summary.whats_wrong = [
+                            v for v in llm_result.summary.whats_wrong 
+                            if v.rule_id != "unit_sale_price" or v.violation_type not in ("missing", "not_found")
+                        ]
+
+                        if not any(d.id == "unit_sale_price" for d in llm_result.summary.what_was_found):
+                            extracted_usp = usp_rate_match or "Unit Sale Price (Declared via package pointer)"
+                            best_bbox = usp_rate_block.bbox if usp_rate_block else next(
+                                (b.bbox for b in ocr_result.text_blocks if _USP_POINTER_RE.search(flatten_text(b.text))),
+                                None
                             )
-                            v.detected_on_package = clean_nq
-                            v.expected_on_package = "Total Net Quantity: 150 g (30 N x 5 g)"
-                            v.citation = citation_svc.get_citation("multi_piece_net_quantity") or citation_svc.get_citation("rule_24_multi_piece")
-                    if not v.citation:
-                        v.citation = citation_svc.get_citation(v.rule_id)
+                            font_px = usp_rate_block.size.estimated_font_size_px if usp_rate_block else 16.0
+                            llm_result.summary.what_was_found.append(DeclarationFound(
+                                id="unit_sale_price",
+                                field_name="Unit Sale Price",
+                                extracted_text=extracted_usp,
+                                parsed_value=usp_rate_match or extracted_usp,
+                                confidence=0.95,
+                                bbox=best_bbox,
+                                font_size_px=font_px,
+                                font_size_mm_est=self._estimate_font_mm(font_px, ocr_result.image_metadata.height),
+                                format_valid=True,
+                                size_valid=True,
+                                status="COMPLIANT",
+                                citation=citation_svc.get_citation("unit_sale_price")
+                            ))
 
-                if image_bytes:
-                    evidence_b64 = self.generate_violation_evidence_image(
-                        image_bytes,
-                        llm_result.summary.whats_wrong,
-                        llm_result.summary.whats_missing
-                    )
-                    if evidence_b64:
-                        llm_result.annotated_image_base64 = evidence_b64
-                return llm_result
+                        if not llm_result.summary.whats_wrong and not llm_result.summary.whats_missing:
+                            llm_result.overall_result = "PASS"
+
+                    if image_bytes:
+                        evidence_b64 = self.generate_violation_evidence_image(
+                            image_bytes,
+                            llm_result.summary.whats_wrong,
+                            llm_result.summary.whats_missing
+                        )
+                        if evidence_b64:
+                            llm_result.annotated_image_base64 = evidence_b64
+                    return llm_result
+            except Exception as llm_err:
+                logger.exception("LLM evaluation post-processing failed: %s. Falling back to deterministic engine.", llm_err)
 
         start_time = time.time()
         
@@ -375,8 +445,9 @@ class ComplianceEvaluator:
 
         # Build dynamic matchers for all rules present in active ruleset
         standard_map = {
+            "unit_sale_price": (self._is_unit_sale_price, lambda b: self._eval_unit_sale_price(b, img_height, doc_norm, all_blocks=blocks)),
             "mrp": (self._is_mrp, lambda b: self._eval_mrp(b, ocr_result, doc_norm)),
-            "net_quantity": (self._is_net_quantity, lambda b: self._eval_net_quantity(b, img_height, doc_norm)),
+            "net_quantity": (self._is_net_quantity, lambda b: self._eval_net_quantity(b, img_height, doc_norm, all_blocks=blocks)),
             "manufacture_date": (self._is_mfg_date, lambda b: self._eval_mfg_date(b, img_height)),
             "consumer_care": (self._is_consumer_care, lambda b: self._eval_consumer_care(b, img_height)),
             "manufacturer_details": (self._is_manufacturer_details, lambda b: self._eval_manufacturer_details(b, img_height)),
@@ -423,9 +494,13 @@ class ComplianceEvaluator:
             for idx, block in enumerate(blocks):
                 text = block.text.strip()
                 joined = f"{text} {blocks[idx + 1].text.strip()}" if idx + 1 < len(blocks) else text
-                if detector(text) or detector(joined):
+                if detector(text):
                     decl, viols = evaluator(block)
                     self._add_candidate(candidates, rule_id, block, decl, viols)
+                elif detector(joined):
+                    combined_block = block.model_copy(update={"text": joined})
+                    decl, viols = evaluator(combined_block)
+                    self._add_candidate(candidates, rule_id, combined_block, decl, viols)
 
         # Step 1c: Keep exactly one declaration per rule id - the best-evidence block
         # (the one actually carrying the price/quantity/date, then the largest and most
@@ -732,6 +807,8 @@ class ComplianceEvaluator:
         flat = flatten_text(text)
         if rule_id == "mrp":
             return bool(re.search(r"\d", flat))
+        if rule_id == "unit_sale_price":
+            return bool(_UNIT_SALE_PRICE_RATE_RE.search(flat)) or bool(re.search(r"\d", flat))
         if rule_id == "net_quantity":
             return bool(_QUANTITY_RE.search(flat))
         if rule_id == "manufacture_date":
@@ -760,6 +837,8 @@ class ComplianceEvaluator:
             keywords = [clean_name]
 
         def detector(text: str) -> bool:
+            if rule_id == "unit_sale_price":
+                return self._is_unit_sale_price(text)
             t_upper = text.upper()
             if custom_regex and re.search(custom_regex, text, re.IGNORECASE):
                 return True
@@ -820,24 +899,46 @@ class ComplianceEvaluator:
 
     # --- Entity Detection Helpers (Brand-Agnostic & Fully Generalized) ---
 
+    def _is_unit_sale_price(self, text: str) -> bool:
+        flat = flatten_text(text)
+        if _UNIT_SALE_PRICE_RATE_RE.search(flat):
+            return True
+        if _USP_POINTER_RE.search(flat):
+            return True
+        if _USP_KEYWORD_RE.search(flat) and re.search(r"\d", flat):
+            return True
+        return False
+
     def _is_mrp(self, text: str) -> bool:
         norm = normalize_phrase(text)
+        flat = flatten_text(text)
+        # Unit sale price declarations (e.g. "RS.10.00/N") must NEVER be captured as MRP!
+        if self._is_unit_sale_price(text) and not (_has_keyword(norm, _MRP_KEYWORDS) or has_tax_clause(norm)):
+            return False
         if _has_keyword(norm, _MRP_KEYWORDS) or has_tax_clause(norm):
             return True
-        # A bare price only counts as MRP when the currency token stands as its own word;
-        # plain "RS" substring matching also fires on words like CUSTOMERS.
-        flat = flatten_text(text)
         return bool(_CURRENCY_RE.search(flat)) and bool(re.search(r"\d", flat))
 
+    _NUTRITION_TERMS = {"ENERGY", "PROTEIN", "CARBOHYDRATE", "FAT", "SUGAR", "SUGARS", "KCAL", "NUTRITION", "NUTRITIONAL", "SERVING"}
+
     def _is_net_quantity(self, text: str) -> bool:
-        return _has_keyword(normalize_phrase(text), _NET_QTY_KEYWORDS) or bool(_QUANTITY_RE.search(flatten_text(text)))
+        norm = normalize_phrase(text)
+        # Disqualify nutritional panels from being flagged as product net quantity
+        if any(term in norm for term in self._NUTRITION_TERMS):
+            return False
+        if _has_keyword(norm, _NET_QTY_KEYWORDS):
+            return True
+        flat = flatten_text(text)
+        return bool(_QUANTITY_RE.search(flat)) and len(flat.split()) <= 5
 
     def _is_mfg_date(self, text: str) -> bool:
         return _has_keyword(normalize_phrase(text), _MFG_DATE_KEYWORDS) or bool(_DATE_RE.search(flatten_text(text)))
 
     def _is_manufacturer_details(self, text: str) -> bool:
-        # Brand-agnostic manufacturer patterns: manufacturing verbs + corporate entity indicators + 6-digit pincode
         norm = normalize_phrase(text)
+        # Pricing, tax clauses, and unit sale price must never be classified as manufacturer
+        if has_tax_clause(norm) or "UNIT SALE PRICE" in norm or "UNIT PRICE" in norm or "USP" in norm:
+            return False
         return _has_keyword(norm, _MANUFACTURER_KEYWORDS) or self._looks_like_pincode(norm)
 
     def _looks_like_pincode(self, norm: str) -> bool:
@@ -997,9 +1098,87 @@ class ComplianceEvaluator:
         )
         return decl, viols
 
-    def _eval_net_quantity(self, block: TextBlock, img_height: int, doc_norm: Optional[str] = None) -> tuple[DeclarationFound, List[ViolationDetail]]:
+    def _eval_unit_sale_price(self, block: TextBlock, img_height: int, doc_norm: Optional[str] = None,
+                              all_blocks: Optional[List[TextBlock]] = None) -> tuple[DeclarationFound, List[ViolationDetail]]:
+        text = block.text.strip()
+        flat = flatten_text(text)
+
+        extracted_rate = None
+        m_rate = _UNIT_SALE_PRICE_RATE_RE.search(flat)
+        if m_rate:
+            extracted_rate = m_rate.group(0)
+        elif all_blocks:
+            for other_b in all_blocks:
+                if other_b.id == block.id:
+                    continue
+                other_flat = flatten_text(other_b.text)
+                m_other = _UNIT_SALE_PRICE_RATE_RE.search(other_flat)
+                if m_other:
+                    extracted_rate = m_other.group(0)
+                    text = f"{extracted_rate} (via '{text}')"
+                    break
+
+        if not extracted_rate and doc_norm:
+            m_doc = _UNIT_SALE_PRICE_RATE_RE.search(doc_norm)
+            if m_doc:
+                extracted_rate = m_doc.group(0)
+                text = f"{extracted_rate} (referenced on package)"
+
+        final_extracted = extracted_rate or text
+
+        min_font = self._get_min_font_size("unit_sale_price", 1.0)
+        font_size_mm = self._estimate_font_mm(block.size.estimated_font_size_px, img_height)
+        size_valid = font_size_mm >= min_font
+        format_valid = bool(extracted_rate or _USP_POINTER_RE.search(flat))
+
+        viols: List[ViolationDetail] = []
+        if not size_valid:
+            viols.append(ViolationDetail(
+                id=f"viol_usp_font_{block.id}",
+                rule_id="unit_sale_price",
+                field_name=self.rule_map.get("unit_sale_price", {}).get("field_name", "Unit Sale Price"),
+                violation_type="too_small",
+                severity="MINOR",
+                description=f"Unit Sale Price font size ({font_size_mm:.1f}mm) is below minimum prescribed ({min_font:.1f}mm).",
+                evidence_bbox=block.bbox
+            ))
+
+        status = "COMPLIANT" if (format_valid and size_valid) else ("FORMAT_ERROR" if not format_valid else "TOO_SMALL")
+
+        decl = DeclarationFound(
+            id="unit_sale_price",
+            field_name=self.rule_map.get("unit_sale_price", {}).get("field_name", "Unit Sale Price"),
+            extracted_text=final_extracted,
+            parsed_value=extracted_rate or final_extracted,
+            confidence=round(block.confidence, 2),
+            bbox=block.bbox,
+            font_size_px=block.size.estimated_font_size_px,
+            font_size_mm_est=font_size_mm,
+            format_valid=format_valid,
+            size_valid=size_valid,
+            status=status
+        )
+        return decl, viols
+
+    def _eval_net_quantity(self, block: TextBlock, img_height: int, doc_norm: Optional[str] = None,
+                           all_blocks: Optional[List[TextBlock]] = None) -> tuple[DeclarationFound, List[ViolationDetail]]:
         text = block.text
         t_upper = flatten_text(text)
+
+        # If the block only contains the keyword prefix (e.g. "Net Qty.:") without the quantity value,
+        # stitch it with the adjacent or closest quantity block that isn't a nutrition panel.
+        if not _QUANTITY_RE.search(t_upper) and all_blocks:
+            for other_b in all_blocks:
+                if other_b.id == block.id:
+                    continue
+                other_text = other_b.text.strip()
+                other_norm = normalize_phrase(other_text)
+                if any(term in other_norm for term in self._NUTRITION_TERMS):
+                    continue
+                if _QUANTITY_RE.search(flatten_text(other_text)):
+                    text = f"{text.strip()} {other_text}"
+                    t_upper = flatten_text(text)
+                    break
         viols = []
         citation_svc = get_citation_service()
 

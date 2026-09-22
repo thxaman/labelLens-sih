@@ -19,14 +19,29 @@ export async function fileComplaint(user, data) {
     throw new Error("Title and description are required for filing a complaint");
   }
 
+  // Resolve district/state: explicit > consumer profile > inspector's district (from linked inspection)
+  let resolvedDistrict = district || user.district || null;
+  let resolvedState = state || user.state || null;
+
+  if ((!resolvedDistrict || !resolvedState) && inspectionId) {
+    const linkedInspection = await prisma.inspection.findUnique({
+      where: { id: inspectionId },
+      select: { inspector: { select: { district: true, state: true } } },
+    });
+    if (linkedInspection?.inspector) {
+      resolvedDistrict = resolvedDistrict || linkedInspection.inspector.district || null;
+      resolvedState = resolvedState || linkedInspection.inspector.state || null;
+    }
+  }
+
   const complaint = await prisma.complaint.create({
     data: {
       consumerId: user.id,
       inspectionId: inspectionId || null,
       title: String(title).trim(),
       description: String(description).trim(),
-      district: district || user.district || null,
-      state: state || user.state || null,
+      district: resolvedDistrict,
+      state: resolvedState,
       status: "PENDING",
     },
     include: {

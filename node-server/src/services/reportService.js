@@ -40,7 +40,7 @@ export async function createInspectionSummaryReport(user, inspectionId) {
     inspection,
     product: inspection.product,
     violations: inspection.violations,
-    declarations: [],
+    declarations: inspection.extractedDeclarations || [],
     inspector: inspection.inspector,
     category: inspection.product?.category || "general",
   });
